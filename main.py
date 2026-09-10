@@ -7,6 +7,7 @@ Run: OPENROUTER_API_KEY=sk-or-... PRIVACY_MODE=prioritise_privacy uvicorn main:a
 import os
 import time
 import json
+import hashlib
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -29,9 +30,13 @@ MODE_POLICY = {
 
 POLICY_TTL = 3600.0
 PICK_TTL = 60.0
+RUN_TTL = 3600.0  # agent-run accumulator expiry
 _policies: dict[str, dict] = {}
 _policies_at = 0.0
 _pick_cache: dict[str, tuple[float, list[str], list[dict], dict[str, dict]]] = {}
+# run-key -> {"calls", "tokens", "cost", "ms", "t"} for the current agent run
+# (one user prompt -> Copilot's tool-loop makes several LLM calls)
+_runs: dict[str, dict] = {}
 
 
 async def load_policies(client: httpx.AsyncClient) -> dict[str, dict]:
@@ -229,6 +234,62 @@ def fmt_price(ep: dict) -> str | None:
     return f"${round(p, 4):g}/${round(c, 4):g} per M"
 
 
+def first_user_text(messages: list) -> str:
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return ""
+
+
+def run_key(model: str, messages: list) -> str | None:
+    """Identity of one agent run (one user prompt): Copilot's tool loop repeats
+    the same first user message across its follow-up calls."""
+    text = first_user_text(messages)
+    if not text:
+        return None
+    return hashlib.sha256(f"{model}|{text}".encode()).hexdigest()[:16]
+
+
+def update_run(key: str | None, usage: dict | None, total_ms: float) -> dict | None:
+    """Fold this call's metrics into the run accumulator; return the cumulative
+    run stats (calls/tokens/cost/ms) to render in the footer."""
+    if not key:
+        return None
+    now = time.time()
+    for k in [k for k, v in _runs.items() if now - v["t"] > RUN_TTL]:
+        del _runs[k]
+    run = _runs.setdefault(key, {"calls": 0, "tokens": 0, "cost": 0.0, "ms": 0.0, "t": now})
+    run["calls"] += 1
+    run["ms"] += total_ms
+    run["t"] = now
+    if isinstance(usage, dict):
+        n = usage.get("completion_tokens")
+        if isinstance(n, (int, float)) and n > 0:
+            run["tokens"] += int(n)
+        cost = usage.get("cost")
+        if isinstance(cost, (int, float)) and cost > 0:
+            run["cost"] += cost
+    return run
+
+
+def fmt_run(run: dict | None) -> str | None:
+    if not run or run["calls"] < 2:
+        return None  # single-call run: the per-call footer already says it all
+    bits = [f"{run['calls']} calls"]
+    if run["tokens"]:
+        bits.append(f"{run['tokens']:,} tok")
+    if run["cost"]:
+        bits.append(f"${round(run['cost'], 5):g}")
+    if run["ms"]:
+        bits.append(f"{fmt_ms(run['ms'])} total")
+    return f"*Run: {' · '.join(bits)}*"
+
+
 def fmt_measured_tps(usage: dict | None, measured: dict | None) -> str | None:
     """Request-measured tok/s: completion tokens over the relayed stream time.
     Shown when the endpoints lookup lacks stats (unauthenticated lookup)."""
@@ -271,10 +332,12 @@ def match_endpoint(meta: dict, endpoints: list[dict]) -> tuple[dict | None, dict
 
 def provider_footer(meta: dict, endpoints: list[dict], policies: dict[str, dict],
                     usage: dict | None = None,
-                    measured: dict | None = None) -> str | None:
+                    measured: dict | None = None,
+                    run: dict | None = None) -> str | None:
     """Markdown footer describing the endpoint that served the request, with
     stats from the endpoints lookup (throughput/latency/price/privacy) plus
-    this request's own measured ttft/total when available."""
+    this request's own measured ttft/total when available, plus cumulative
+    stats for the agent run (Copilot tool-loop calls sharing one prompt)."""
     sel, ep = match_endpoint(meta, endpoints)
     if not sel:
         return None
@@ -297,7 +360,11 @@ def provider_footer(meta: dict, endpoints: list[dict], policies: dict[str, dict]
         v = measured.get("total_ms")
         if isinstance(v, (int, float)) and v > 0:
             bits.append(f"total {fmt_ms(v)}")
-    return f"\n\n---\n*Routed via {' · '.join(bits)}*\n*Total cost: {cost if cost else ''}*"
+    footer = f"\n\n---\n*Routed via {' · '.join(bits)}*\n*Total cost: {cost if cost else ''}*"
+    run_line = fmt_run(run)
+    if run_line:
+        footer += f"\n{run_line}"
+    return footer
 
 
 def sse_delta(obj: dict, footer: str) -> bytes:
@@ -348,9 +415,11 @@ async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dic
 
             if text == b"data: [DONE]":
                 if SHOW_FOOTER and meta_obj is not None:
-                    measured = {"total_ms": (time.monotonic() - t0) * 1000} if t0 is not None else {}
+                    total_ms = (time.monotonic() - t0) * 1000 if t0 is not None else 0.0
+                    measured = {"total_ms": total_ms} if t0 is not None else {}
+                    run = update_run(rkey, usage, total_ms)
                     footer = provider_footer(meta_obj["openrouter_metadata"],
-                                             endpoints, policies, usage, measured)
+                                             endpoints, policies, usage, measured, run)
                     if footer:
                         injected = True
                         target = held if held is not None else stop_line
@@ -416,6 +485,7 @@ async def relay(request: Request, body: bytes | None):
 
     endpoints: list[dict] = []
     policies: dict[str, dict] = {}
+    rkey: str | None = None
     if body is not None:
         try:
             parsed = json.loads(body)
@@ -423,6 +493,7 @@ async def relay(request: Request, body: bytes | None):
             return JSONResponse(status_code=400,
                                 content={"error": {"message": "request body is not valid JSON"}})
         model = parsed.get("model", "")
+        rkey = run_key(model, parsed.get("messages"))
         try:
             tags, endpoints, policies = await pick_provider(model, headers.get("Authorization", ""))
         except httpx.HTTPError:
@@ -478,9 +549,10 @@ async def relay(request: Request, body: bytes | None):
     if SHOW_FOOTER and "application/json" in ctype:
         try:
             payload = json.loads(content)
+            run = update_run(rkey, payload.get("usage"), total_ms)
             footer = provider_footer(payload.get("openrouter_metadata") or {},
                                      endpoints, policies, payload.get("usage"),
-                                     {"total_ms": total_ms})
+                                     {"total_ms": total_ms}, run)
             print(f"[footer] json: metadata={'yes' if payload.get('openrouter_metadata') else 'no'} "
                   f"footer={'yes' if footer else 'no'}", flush=True)
             if footer and payload.get("choices"):
