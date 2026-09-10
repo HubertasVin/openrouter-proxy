@@ -14,15 +14,12 @@ from fastapi.responses import StreamingResponse, JSONResponse, Response
 OPENROUTER = "https://openrouter.ai/api/v1"
 FRONTEND = "https://openrouter.ai/api/frontend/v1"
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-# full_privacy | prioritise_privacy | can_retain_prompts | can_train
 PRIVACY_MODE = os.environ.get("PRIVACY_MODE", "prioritise_privacy").lower()
-# append a "routed via X" markdown footer to responses
 SHOW_FOOTER = os.environ.get("PROXY_FOOTER", "1").lower() not in ("0", "false", "no")
 
 app = FastAPI()
 
-# mode -> (allow_prompt_retention, allow_training). prioritise_privacy keeps the
-# pool unrestricted; its privacy preference is applied in the pick step instead.
+# mode -> (allow_prompt_retention, allow_training)
 MODE_POLICY = {
     "full_privacy": (False, False),
     "prioritise_privacy": (True, True),
@@ -30,8 +27,8 @@ MODE_POLICY = {
     "can_train": (True, True),
 }
 
-POLICY_TTL = 3600.0  # provider data-policy refresh
-PICK_TTL = 60.0      # provider-pick cache per model+mode
+POLICY_TTL = 3600.0
+PICK_TTL = 60.0
 _policies: dict[str, dict] = {}
 _policies_at = 0.0
 _pick_cache: dict[str, tuple[float, list[str], list[dict], dict[str, dict]]] = {}
@@ -49,12 +46,11 @@ async def load_policies(client: httpx.AsyncClient) -> dict[str, dict]:
         _policies = {p["slug"]: p.get("dataPolicy") or {} for p in r.json().get("data", [])}
         _policies_at = time.time()
     except httpx.HTTPError:
-        pass  # keep stale data; privacy_ok degrades to allow-all when empty
+        pass
     return _policies
 
 
 def provider_slug(ep: dict) -> str:
-    # tag looks like "deepinfra/fp8" (provider/variant) or "fireworks"
     return (ep.get("tag") or "").split("/")[0]
 
 
@@ -71,7 +67,6 @@ def price(ep: dict) -> float:
 
 
 def throughput(ep: dict) -> float:
-    # p50 tokens/sec over the last 30 min; null unless the lookup is authenticated
     stats = ep.get("throughput_last_30m") or {}
     try:
         return float(stats.get("p50") or 0)
@@ -82,7 +77,7 @@ def throughput(ep: dict) -> float:
 def is_fully_private(ep: dict, policies: dict[str, dict]) -> bool:
     pol = policies.get(provider_slug(ep))
     if pol is None:
-        return False  # unknown provider: can't claim privacy
+        return False
     return (not pol.get("retainsPrompts", True)
             and not pol.get("training", True)
             and not pol.get("trainingOpenRouter", True))
@@ -92,7 +87,6 @@ def privacy_ok(ep: dict, policies: dict[str, dict],
                allow_retention: bool, allow_training: bool) -> bool:
     pol = policies.get(provider_slug(ep))
     if pol is None:
-        # unknown policy = worst case (retains + trains): only can_train admits it
         return allow_retention and allow_training
     return ((allow_retention or not pol.get("retainsPrompts", True))
             and (allow_training or not (pol.get("training", True)
@@ -113,24 +107,18 @@ def filter_providers(endpoints: list[dict], policies: dict[str, dict],
         return []
 
     measured = [e for e in pool if throughput(e) > 0]
-    survivors = pool  # no throughput data visible; skip the floor
+    survivors = pool
     if measured:
         fastest = max(throughput(e) for e in measured)
-        # unmeasured endpoints stay in the pool (can't be evaluated); the
-        # floor only gates endpoints with known throughput
         for factor in (0.4, 0.3, 0.2):
             floor = factor * fastest
             survivors = [e for e in pool
                          if throughput(e) == 0 or throughput(e) >= floor]
             n_clear = sum(1 for e in survivors if throughput(e) > 0)
-            if n_clear - 1 >= 2 or factor == 0.2:  # -1: the fastest itself
+            if n_clear - 1 >= 2 or factor == 0.2:
                 break
 
-    # Sort by price, but treat prices within 1% as tied and prefer the faster
-    # endpoint within a tie group. OpenRouter's UI rounds prices, so two
-    # endpoints that display the same price can differ by fractions of a cent
-    # (e.g. Modal 0.649935 vs BaseTen 0.65 $/Mtok) and a raw price sort would
-    # put the slower one first.
+    # prices within 1% are tied; prefer the faster endpoint in a tie group
     survivors.sort(key=price)
     tied: list[dict] = []
     ordered: list[dict] = []
@@ -169,7 +157,7 @@ async def pick_provider(model: str, auth: str) -> tuple[list[str], list[dict], d
     if cached and now - cached[0] < PICK_TTL:
         return cached[1], cached[2], cached[3]
 
-    base = model.split(":")[0]  # strip :free/:nitro variants
+    base = model.split(":")[0]
     author, _, slug = base.partition("/")
     if not slug:
         return [], [], {}
@@ -193,7 +181,6 @@ def upstream_headers(request: Request) -> dict[str, str]:
         "Content-Type": "application/json",
         "HTTP-Referer": request.headers.get("HTTP-Referer", "http://localhost"),
         "X-Title": request.headers.get("X-Title", "openrouter-proxy"),
-        # ask OpenRouter which provider actually served the request
         "X-OpenRouter-Metadata": "enabled",
     }
     if auth:
@@ -328,7 +315,7 @@ async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dic
     buf = b""
     usage: dict | None = None
     meta_obj: dict | None = None
-    held: bytes | None = None   # last content-bearing data line, unflushed
+    held: bytes | None = None
     stop_line: bytes | None = None
     tail: list[bytes] = []
     injected = False
@@ -387,7 +374,7 @@ async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dic
                     yield held + b"\n"
                 held = text
             elif has_finish and stop_line is None:
-                stop_line = text  # hold the stop line until [DONE]
+                stop_line = text
             else:
                 if stop_line is not None:
                     tail.append(text)
@@ -407,7 +394,6 @@ async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dic
 
 async def relay(request: Request, body: bytes | None):
     headers = upstream_headers(request)
-    # client paths start with /v1 (OpenAI style); OPENROUTER already ends in /api/v1
     path = request.url.path.removeprefix("/").removeprefix("v1/").removeprefix("/")
     url = f"{OPENROUTER}/{path}"
 
@@ -423,26 +409,20 @@ async def relay(request: Request, body: bytes | None):
         try:
             tags, endpoints, policies = await pick_provider(model, headers.get("Authorization", ""))
         except httpx.HTTPError:
-            tags = []  # lookup failed
+            tags = []
         print(f"[relay] model={model!r} tags={len(tags)}", flush=True)
         if not tags and PRIVACY_MODE != "can_train":
-            # unpinned routing can land on a provider that retains/trains on
-            # prompts; privacy modes refuse instead
             return JSONResponse(status_code=502, content={"error": {
                 "message": f"no provider satisfies PRIVACY_MODE={PRIVACY_MODE} "
                            f"for '{model or 'unknown model'}'; refusing to route unpinned"}})
         if tags:
-            # full tags pin exact endpoint variants (provider + quantization);
-            # order gives OpenRouter fallbacks within the filtered set
             parsed["provider"] = {"order": tags, "allow_fallbacks": False}
         else:
             parsed.pop("provider", None)
-        # ask OpenRouter to report the actual cost of this request in usage
         if "messages" in parsed and "usage" not in parsed:
             parsed["usage"] = {"include": True}
         body = json.dumps(parsed).encode()
 
-    # unbounded read timeout (streaming); connect still bounded
     client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=30.0))
     req = client.build_request(request.method, url, content=body, headers=headers,
                                params=request.url.query)
