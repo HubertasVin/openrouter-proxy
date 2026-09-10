@@ -30,7 +30,7 @@ MODE_POLICY = {
 
 POLICY_TTL = 3600.0
 PICK_TTL = 60.0
-RUN_TTL = 3600.0  # agent-run accumulator expiry
+RUN_TTL = float(os.environ.get("RUN_TTL", 3600.0))  # agent-run accumulator expiry
 _policies: dict[str, dict] = {}
 _policies_at = 0.0
 _pick_cache: dict[str, tuple[float, list[str], list[dict], dict[str, dict]]] = {}
