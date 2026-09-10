@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 # Install openrouter-proxy as a systemd user service.
 # Usage: OPENROUTER_API_KEY=sk-or-... ./install.sh [repo-url]
+#        or: curl -fsSL <url>/install.sh | bash   (prompts for the key)
 
 set -euo pipefail
 
-REPO_URL="${1:-https://github.com/hubertas/openrouter-proxy.git}"
-INSTALL_DIR="$HOME/tools/openrouter-proxy"
+REPO_URL="${1:-https://github.com/HubertasVin/openrouter-proxy.git}"
+INSTALL_DIR="$HOME/.local/opt/openrouter-proxy"
 CONFIG_DIR="$HOME/.config/openrouter-proxy"
 SERVICE_NAME="openrouter-proxy"
 PORT="8787"
 
 if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    echo "Error: set OPENROUTER_API_KEY first: OPENROUTER_API_KEY=sk-or-... ./install.sh" >&2
+    if [ -t 0 ]; then
+        read -r -p "OpenRouter API key: " OPENROUTER_API_KEY
+    else
+        echo "Error: OPENROUTER_API_KEY not set and stdin is not a terminal." >&2
+        echo "Run: OPENROUTER_API_KEY=sk-or-... bash -c \"\$(curl -fsSL <url>/install.sh)\"" >&2
+        exit 1
+    fi
+fi
+
+if [ -z "$OPENROUTER_API_KEY" ]; then
+    echo "Error: empty API key." >&2
     exit 1
 fi
 
