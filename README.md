@@ -8,14 +8,19 @@ OpenAI-compatible client at `http://localhost:8787/v1`.
 
 ```bash
 pip install -r requirements.txt
-OPENROUTER_API_KEY=sk-or-... uvicorn main:app --port 8787
+uvicorn main:app --port 8787
 ```
+
+Point any OpenAI-compatible client at `http://localhost:8787/v1` with its own
+OpenRouter key — the proxy forwards each client's `Authorization` header
+upstream. `OPENROUTER_API_KEY` in the environment is optional: only a fallback
+for clients that send no key (e.g. curl testing).
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENROUTER_API_KEY` | — | Fallback key when the client sends no `Authorization`. Also used for the endpoint lookup (throughput stats require auth). |
+| `OPENROUTER_API_KEY` | — | Optional. Fallback key when the client sends no `Authorization`; the client's own key always takes priority. Also used for the endpoint lookup when set (throughput stats require auth). |
 | `PRIVACY_MODE` | `prioritise_privacy` | `full_privacy`, `prioritise_privacy`, `can_retain_prompts`, or `can_train`. |
 | `PROXY_FOOTER` | `1` | Set `0` to disable the provider-info footer. |
 
@@ -35,8 +40,9 @@ curl -fsSL https://raw.githubusercontent.com/HubertasVin/openrouter-proxy/main/i
 
 Clones the repo to `~/.local/opt/openrouter-proxy`, creates a Python venv,
 installs dependencies, and registers a systemd user service listening on port
-8787. Set `OPENROUTER_API_KEY` before running, or edit
-`~/.config/openrouter-proxy/env` afterwards.
+8787. No API key is stored — clients (e.g. VS Code BYOK) pass their own key on
+every request; set `OPENROUTER_API_KEY` beforehand only if you want a keyless-
+client fallback, preserved across reinstalls in `~/.config/openrouter-proxy/env`.
 
 ## Filtering
 

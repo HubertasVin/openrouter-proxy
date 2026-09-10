@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Install openrouter-proxy as a systemd user service.
-# Usage: OPENROUTER_API_KEY=sk-or-... ./install.sh [repo-url]
-#        or: curl -fsSL <url>/install.sh | bash   (prompts for the key)
+# Usage: ./install.sh [repo-url]
+# The proxy forwards each client's Authorization header to OpenRouter, so VS
+# Code's BYOK key flows through per-request. OPENROUTER_API_KEY (env var or
+# preserved from a previous install) is optional — only a fallback for clients
+# that send no key, e.g. curl testing.
 
 set -euo pipefail
 
@@ -11,20 +14,11 @@ CONFIG_DIR="$HOME/.config/openrouter-proxy"
 SERVICE_NAME="openrouter-proxy"
 PORT="8787"
 
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    if [ -t 0 ]; then
-        read -r -p "OpenRouter API key: " OPENROUTER_API_KEY
-    else
-        echo "Error: OPENROUTER_API_KEY not set and stdin is not a terminal." >&2
-        echo "Run: OPENROUTER_API_KEY=sk-or-... bash -c \"\$(curl -fsSL <url>/install.sh)\"" >&2
-        exit 1
-    fi
+EXISTING_KEY=""
+if [ -f "$CONFIG_DIR/env" ]; then
+    EXISTING_KEY=$(grep -E '^OPENROUTER_API_KEY=' "$CONFIG_DIR/env" | cut -d= -f2- || true)
 fi
-
-if [ -z "$OPENROUTER_API_KEY" ]; then
-    echo "Error: empty API key." >&2
-    exit 1
-fi
+API_KEY="${OPENROUTER_API_KEY:-$EXISTING_KEY}"
 
 echo "==> Cloning/updating $REPO_URL -> $INSTALL_DIR"
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -43,7 +37,7 @@ echo "==> Writing config to $CONFIG_DIR/env"
 mkdir -p "$CONFIG_DIR"
 umask 077
 cat > "$CONFIG_DIR/env" <<EOF
-OPENROUTER_API_KEY=$OPENROUTER_API_KEY
+OPENROUTER_API_KEY=$API_KEY
 PRIVACY_MODE=${PRIVACY_MODE:-prioritise_privacy}
 PROXY_FOOTER=${PROXY_FOOTER:-1}
 EOF
@@ -71,6 +65,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now "$SERVICE_NAME"
 
 echo "==> Done. Proxy listening on http://127.0.0.1:$PORT/v1"
+echo "    Clients must send their own OpenRouter key (VS Code BYOK does); the"
+echo "    env-file key is only a fallback for keyless clients like curl."
 echo "    Logs:     journalctl --user -u $SERVICE_NAME -f"
 echo "    Stop:     systemctl --user stop $SERVICE_NAME"
 echo "    Config:   $CONFIG_DIR/env (edit, then: systemctl --user restart $SERVICE_NAME)"
