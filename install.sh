@@ -16,7 +16,12 @@ PORT="8787"
 
 EXISTING_KEY=""
 if [ -f "$CONFIG_DIR/env" ]; then
-    EXISTING_KEY=$(grep -E '^OPENROUTER_API_KEY=' "$CONFIG_DIR/env" | cut -d= -f2- || true)
+    line=$(grep -E '^OPENROUTER_API_KEY=' "$CONFIG_DIR/env" | tail -1 || true)
+    val=${line#OPENROUTER_API_KEY=}
+    val=${val%$'\r'}
+    val=${val%%[[:space:]]*}
+    val=${val#"\""}; val=${val%"\""}
+    [ -n "$val" ] && EXISTING_KEY=$val
 fi
 API_KEY="${OPENROUTER_API_KEY:-$EXISTING_KEY}"
 
