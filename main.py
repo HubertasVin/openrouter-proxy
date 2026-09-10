@@ -240,7 +240,7 @@ def fmt_measured_tps(usage: dict | None, measured: dict | None) -> str | None:
         return None
     if not isinstance(n, (int, float)) or n <= 0:
         return None
-    return f"{n / (total_ms / 1000):.1f} tok/s measured"
+    return f"{n / (total_ms / 1000):.1f} tok/s"
 
 
 def fmt_cost(usage: dict | None) -> str | None:
