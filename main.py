@@ -229,6 +229,20 @@ def fmt_price(ep: dict) -> str | None:
     return f"${round(p, 4):g}/${round(c, 4):g} per M"
 
 
+def fmt_measured_tps(usage: dict | None, measured: dict | None) -> str | None:
+    """Request-measured tok/s: completion tokens over the relayed stream time.
+    Shown when the endpoints lookup lacks stats (unauthenticated lookup)."""
+    if not isinstance(usage, dict) or not isinstance(measured, dict):
+        return None
+    total_ms = measured.get("total_ms")
+    n = usage.get("completion_tokens")
+    if not isinstance(total_ms, (int, float)) or total_ms <= 0:
+        return None
+    if not isinstance(n, (int, float)) or n <= 0:
+        return None
+    return f"{n / (total_ms / 1000):.1f} tok/s measured"
+
+
 def fmt_cost(usage: dict | None) -> str | None:
     if not isinstance(usage, dict):
         return None
@@ -276,6 +290,9 @@ def provider_footer(meta: dict, endpoints: list[dict], policies: dict[str, dict]
         if ep.get("supports_implicit_caching"):
             bits.append("implicit cache")
     cost = fmt_cost(usage)
+    mtps = fmt_measured_tps(usage, measured)
+    if mtps:
+        bits.append(mtps)
     if measured:
         v = measured.get("total_ms")
         if isinstance(v, (int, float)) and v > 0:
