@@ -46,11 +46,11 @@ client fallback, preserved across reinstalls in `~/.config/openrouter-proxy/env`
 
 ## Filtering
 
-1. Endpoint must be 8-bit quantized (`int8`/`fp8`/`mxfp8`).
+1. Endpoint must be quantized at 8 bits or below (`int8`/`fp8`/`mxfp8`/`fp4`).
 2. Privacy must satisfy the selected mode.
-3. Adaptive throughput floor: starts at 40% of the fastest endpoint's p50
-   tok/s, relaxes to 30% then 20% until ≥2 other endpoints clear it. Skipped
-   when no throughput data is visible; unmeasured endpoints are never dropped.
+3. Absolute throughput floor: starts at 30 tok/s and relaxes through 25, 20
+   and 15 tok/s until ≥2 endpoints clear it. Unmeasured endpoints are never
+   dropped.
 4. Winner = cheapest survivor, with prices within 1% treated as tied and the
    faster endpoint preferred within a tie.
 

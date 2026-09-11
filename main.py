@@ -59,8 +59,8 @@ def provider_slug(ep: dict) -> str:
     return (ep.get("tag") or "").split("/")[0]
 
 
-def is_8bit(ep: dict) -> bool:
-    return ep.get("quantization") in ("int8", "fp8", "mxfp8")
+def quant_ok(ep: dict) -> bool:
+    return ep.get("quantization") in ("int8", "fp8", "mxfp8", "fp4")
 
 
 def price(ep: dict) -> float:
@@ -100,28 +100,30 @@ def privacy_ok(ep: dict, policies: dict[str, dict],
 
 def filter_providers(endpoints: list[dict], policies: dict[str, dict],
                      mode: str) -> list[dict]:
-    """Single filtering method: 8-bit quantization + privacy + adaptive
-    throughput floor. Returns surviving endpoints, cheapest first; the
-    prioritise_privacy winner (if any) is moved to the front. The full list
-    is used as provider.order so OpenRouter falls back within the filtered
-    set when a provider is rate-limited or down."""
+    """Single filtering method: quantization + privacy + absolute throughput
+    floors. Returns surviving endpoints, cheapest first; the prioritise_privacy
+    winner (if any) is moved to the front. The full list is used as
+    provider.order so OpenRouter falls back within the filtered set when a
+    provider is rate-limited or down."""
     allow_retention, allow_training = MODE_POLICY.get(mode, MODE_POLICY["prioritise_privacy"])
     pool = [e for e in endpoints
-            if is_8bit(e) and privacy_ok(e, policies, allow_retention, allow_training)]
+            if quant_ok(e) and privacy_ok(e, policies, allow_retention, allow_training)]
     if not pool:
         return []
 
-    measured = [e for e in pool if throughput(e) > 0]
     survivors = pool
-    if measured:
-        fastest = max(throughput(e) for e in measured)
-        for factor in (0.4, 0.3, 0.2):
-            floor = factor * fastest
+    for floor in (30, 25, 20, 15):
+        survivors = [e for e in pool
+                     if throughput(e) == 0 or throughput(e) >= floor]
+        n_clear = sum(1 for e in survivors if throughput(e) > 0)
+        if n_clear >= 2:
+            break
+    if not any(throughput(e) > 0 for e in survivors):
+        # nothing clears even 15 tok/s: keep the fastest rather than none
+        top = max(throughput(e) for e in pool)
+        if top > 0:
             survivors = [e for e in pool
-                         if throughput(e) == 0 or throughput(e) >= floor]
-            n_clear = sum(1 for e in survivors if throughput(e) > 0)
-            if n_clear - 1 >= 2 or factor == 0.2:
-                break
+                         if throughput(e) == 0 or throughput(e) >= top]
 
     # prices within 1% are tied; prefer the faster endpoint in a tie group
     survivors.sort(key=price)
