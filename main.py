@@ -255,15 +255,20 @@ def run_key(model: str, messages: list) -> str | None:
     return hashlib.sha256(f"{model}|{text}".encode()).hexdigest()[:16]
 
 
-def update_run(key: str | None, usage: dict | None, total_ms: float) -> dict | None:
-    """Fold this call's metrics into the run accumulator; return the cumulative
-    run stats (calls/tokens/cost/ms) to render in the footer."""
+def update_run(key: str | None, usage: dict | None, total_ms: float,
+               meta: dict | None, endpoints: list[dict],
+               policies: dict[str, dict]) -> dict | None:
+    """Fold this call's metrics and serving-endpoint info into the run
+    accumulator; return the run stats for the footer."""
     if not key:
         return None
     now = time.time()
     for k in [k for k, v in _runs.items() if now - v["t"] > RUN_TTL]:
         del _runs[k]
-    run = _runs.setdefault(key, {"calls": 0, "tokens": 0, "cost": 0.0, "ms": 0.0, "t": now})
+    run = _runs.setdefault(key, {"calls": 0, "tokens": 0, "cost": 0.0,
+                                 "ms": 0.0, "t": now, "providers": [],
+                                 "q": None, "privacy": None, "price": None,
+                                 "cache": False})
     run["calls"] += 1
     run["ms"] += total_ms
     run["t"] = now
@@ -274,20 +279,73 @@ def update_run(key: str | None, usage: dict | None, total_ms: float) -> dict | N
         cost = usage.get("cost")
         if isinstance(cost, (int, float)) and cost > 0:
             run["cost"] += cost
+    sel, ep = match_endpoint(meta or {}, endpoints)
+    if sel:
+        name = sel.get("provider") or "?"
+        if name not in run["providers"]:
+            run["providers"].append(name)
+    if ep:
+        q = ep.get("quantization")
+        if q and q != "unknown":
+            run["q"] = q
+        run["privacy"] = privacy_label(ep, policies)
+        run["price"] = fmt_price(ep)
+        if ep.get("supports_implicit_caching"):
+            run["cache"] = True
     return run
 
 
-def fmt_run(run: dict | None) -> str | None:
-    if not run or run["calls"] < 2:
-        return None  # single-call run: the per-call footer already says it all
-    bits = [f"{run['calls']} calls"]
+def fmt_run(run: dict | None, usage: dict | None,
+            measured: dict | None) -> str | None:
+    """Two-line footer: run aggregates (avg throughput = tokens / summed call
+    time, avg per-call latency, totals) + the serving-endpoint stats."""
+    if not run:
+        # no run tracking (e.g. keyless lookups): minimal per-call footer
+        mtps = fmt_measured_tps(usage, measured)
+        if not mtps:
+            return None
+        bits = [mtps]
+        if isinstance(measured, dict):
+            v = measured.get("total_ms")
+            if isinstance(v, (int, float)) and v > 0:
+                bits.append(f"total {fmt_ms(v)}")
+        return f"\n\n---\n*{(' · '.join(bits))}*"
+    bits = []
+    if run["calls"] > 1:
+        bits.append(f"{run['calls']} calls")
+    if run["ms"] > 0 and run["tokens"]:
+        bits.append(f"avg {run['tokens'] / (run['ms'] / 1000):.1f} tok/s")
+    if run["calls"] > 1 and run["ms"] > 0:
+        bits.append(f"avg {fmt_ms(run['ms'] / run['calls'])}/call")
+    if run["ms"]:
+        bits.append(f"{fmt_ms(run['ms'])} total")
     if run["tokens"]:
         bits.append(f"{run['tokens']:,} tok")
     if run["cost"]:
         bits.append(f"${round(run['cost'], 5):g}")
-    if run["ms"]:
-        bits.append(f"{fmt_ms(run['ms'])} total")
-    return f"*Run: {' · '.join(bits)}*"
+    line1 = f"*Run: {' · '.join(bits)}*" if bits else None
+
+    stat_bits = []
+    if run["providers"]:
+        stat_bits.append("**" + "+".join(run["providers"]) + "**")
+    if run["q"]:
+        stat_bits.append(run["q"])
+    if run["privacy"]:
+        stat_bits.append(run["privacy"])
+    if run["price"]:
+        stat_bits.append(run["price"])
+    if run["cache"]:
+        stat_bits.append("implicit cache")
+    line2 = f"*via {' · '.join(stat_bits)}*" if stat_bits else None
+
+    if not line1 and not line2:
+        return None
+    out = "\n\n---"
+    if line1:
+        out += f"\n{line1}"
+    if line2:
+        out += f"\n{line2}"
+    return out
 
 
 def fmt_measured_tps(usage: dict | None, measured: dict | None) -> str | None:
@@ -334,37 +392,9 @@ def provider_footer(meta: dict, endpoints: list[dict], policies: dict[str, dict]
                     usage: dict | None = None,
                     measured: dict | None = None,
                     run: dict | None = None) -> str | None:
-    """Markdown footer describing the endpoint that served the request, with
-    stats from the endpoints lookup (throughput/latency/price/privacy) plus
-    this request's own measured ttft/total when available, plus cumulative
-    stats for the agent run (Copilot tool-loop calls sharing one prompt)."""
-    sel, ep = match_endpoint(meta, endpoints)
-    if not sel:
-        return None
-    bits = [f"**{sel.get('provider') or '?'}**"]
-    if ep:
-        q = ep.get("quantization")
-        if q and q != "unknown":
-            bits.append(q)
-        for piece in (fmt_throughput(ep), fmt_latency(ep), fmt_price(ep),
-                      privacy_label(ep, policies)):
-            if piece:
-                bits.append(piece)
-        if ep.get("supports_implicit_caching"):
-            bits.append("implicit cache")
-    cost = fmt_cost(usage)
-    mtps = fmt_measured_tps(usage, measured)
-    if mtps:
-        bits.append(mtps)
-    if measured:
-        v = measured.get("total_ms")
-        if isinstance(v, (int, float)) and v > 0:
-            bits.append(f"total {fmt_ms(v)}")
-    footer = f"\n\n---\n*Routed via {' · '.join(bits)}*\n*Total cost: {cost if cost else ''}*"
-    run_line = fmt_run(run)
-    if run_line:
-        footer += f"\n{run_line}"
-    return footer
+    """Compact footer: run aggregates (avg throughput/latency, totals) plus the
+    serving-endpoint stats. One block, at most two lines."""
+    return fmt_run(run, usage, measured)
 
 
 def sse_delta(obj: dict, footer: str) -> bytes:
@@ -417,7 +447,8 @@ async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dic
                 if SHOW_FOOTER and meta_obj is not None:
                     total_ms = (time.monotonic() - t0) * 1000 if t0 is not None else 0.0
                     measured = {"total_ms": total_ms} if t0 is not None else {}
-                    run = update_run(rkey, usage, total_ms)
+                    run = update_run(rkey, usage, total_ms,
+                                     meta_obj["openrouter_metadata"], endpoints, policies)
                     footer = provider_footer(meta_obj["openrouter_metadata"],
                                              endpoints, policies, usage, measured, run)
                     if footer:
@@ -549,7 +580,9 @@ async def relay(request: Request, body: bytes | None):
     if SHOW_FOOTER and "application/json" in ctype:
         try:
             payload = json.loads(content)
-            run = update_run(rkey, payload.get("usage"), total_ms)
+            run = update_run(rkey, payload.get("usage"), total_ms,
+                             payload.get("openrouter_metadata") or {},
+                             endpoints, policies)
             footer = provider_footer(payload.get("openrouter_metadata") or {},
                                      endpoints, policies, payload.get("usage"),
                                      {"total_ms": total_ms}, run)
