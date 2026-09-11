@@ -388,7 +388,7 @@ def sse_rewrite(line: bytes, footer: str) -> bytes:
 
 
 async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dict],
-                          t0: float | None = None):
+                          t0: float | None = None, rkey: str | None = None):
     """Pass upstream SSE through with the provider-info footer folded into the
     last content chunk. A footer delta emitted after the finish_reason chunk is
     dropped by clients that finalize the message there (VS Code chat), so the
@@ -533,7 +533,7 @@ async def relay(request: Request, body: bytes | None):
         async def stream():
             try:
                 async for chunk in sse_with_footer(resp.aiter_bytes(), endpoints,
-                                                   policies, t0):
+                                                   policies, t0, rkey):
                     yield chunk
             finally:
                 await resp.aclose()
