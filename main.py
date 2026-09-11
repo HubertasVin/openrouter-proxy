@@ -216,7 +216,7 @@ def fmt_latency(ep: dict) -> str | None:
     if isinstance(lat, dict):
         lat = lat.get("p50")
     if isinstance(lat, (int, float)) and lat > 0:
-        return f"{lat:g} ms p50"
+        return f"{lat:g} ms p50"    
     return None
 
 
@@ -266,9 +266,7 @@ def update_run(key: str | None, usage: dict | None, total_ms: float,
     for k in [k for k, v in _runs.items() if now - v["t"] > RUN_TTL]:
         del _runs[k]
     run = _runs.setdefault(key, {"calls": 0, "tokens": 0, "cost": 0.0,
-                                 "ms": 0.0, "t": now, "providers": [],
-                                 "q": None, "privacy": None, "price": None,
-                                 "cache": False})
+                                 "ms": 0.0, "t": now, "providers": {}})
     run["calls"] += 1
     run["ms"] += total_ms
     run["t"] = now
@@ -282,23 +280,49 @@ def update_run(key: str | None, usage: dict | None, total_ms: float,
     sel, ep = match_endpoint(meta or {}, endpoints)
     if sel:
         name = sel.get("provider") or "?"
-        if name not in run["providers"]:
-            run["providers"].append(name)
-    if ep:
-        q = ep.get("quantization")
-        if q and q != "unknown":
-            run["q"] = q
-        run["privacy"] = privacy_label(ep, policies)
-        run["price"] = fmt_price(ep)
-        if ep.get("supports_implicit_caching"):
-            run["cache"] = True
+        prov = run["providers"].setdefault(name, {"calls": 0, "tokens": 0,
+                                                  "ms": 0.0, "q": None,
+                                                  "privacy": None, "price": None,
+                                                  "cache": False})
+        prov["calls"] += 1
+        prov["ms"] += total_ms
+        if isinstance(usage, dict):
+            n = usage.get("completion_tokens")
+            if isinstance(n, (int, float)) and n > 0:
+                prov["tokens"] += int(n)
+        if ep:
+            q = ep.get("quantization")
+            if q and q != "unknown":
+                prov["q"] = q
+            prov["privacy"] = privacy_label(ep, policies)
+            prov["price"] = fmt_price(ep)
+            if ep.get("supports_implicit_caching"):
+                prov["cache"] = True
     return run
+
+
+def fmt_provider_line(name: str, prov: dict) -> str:
+    """One provider's run-so-far aggregates (no per-call cost/tokens/time)."""
+    bits = [f"**{name}**"]
+    calls = prov["calls"]
+    if calls > 1:
+        bits.append(f"{calls} calls")
+    if prov["ms"] > 0 and prov["tokens"]:
+        bits.append(f"avg {prov['tokens'] / (prov['ms'] / 1000):.1f} tok/s")
+    if calls > 1 and prov["ms"] > 0:
+        bits.append(f"avg {fmt_ms(prov['ms'] / calls)}/call")
+    for key in ("q", "privacy", "price"):
+        if prov[key]:
+            bits.append(prov[key])
+    if prov["cache"]:
+        bits.append("implicit cache")
+    return f"*via {' · '.join(bits)}*"
 
 
 def fmt_run(run: dict | None, usage: dict | None,
             measured: dict | None) -> str | None:
-    """Two-line footer: run aggregates (avg throughput = tokens / summed call
-    time, avg per-call latency, totals) + the serving-endpoint stats."""
+    """Footer: one line per provider used in the run (its aggregates + endpoint
+    stats), then the run total."""
     if not run:
         # no run tracking (e.g. keyless lookups): minimal per-call footer
         mtps = fmt_measured_tps(usage, measured)
@@ -310,6 +334,10 @@ def fmt_run(run: dict | None, usage: dict | None,
             if isinstance(v, (int, float)) and v > 0:
                 bits.append(f"total {fmt_ms(v)}")
         return f"\n\n---\n*{(' · '.join(bits))}*"
+
+    lines = [fmt_provider_line(name, prov)
+             for name, prov in run["providers"].items()]
+
     bits = []
     if run["calls"] > 1:
         bits.append(f"{run['calls']} calls")
@@ -323,29 +351,12 @@ def fmt_run(run: dict | None, usage: dict | None,
         bits.append(f"{run['tokens']:,} tok")
     if run["cost"]:
         bits.append(f"${round(run['cost'], 5):g}")
-    line1 = f"*Run: {' · '.join(bits)}*" if bits else None
+    if bits:
+        lines.append(f"*Run total: {' · '.join(bits)}*")
 
-    stat_bits = []
-    if run["providers"]:
-        stat_bits.append("**" + "+".join(run["providers"]) + "**")
-    if run["q"]:
-        stat_bits.append(run["q"])
-    if run["privacy"]:
-        stat_bits.append(run["privacy"])
-    if run["price"]:
-        stat_bits.append(run["price"])
-    if run["cache"]:
-        stat_bits.append("implicit cache")
-    line2 = f"*via {' · '.join(stat_bits)}*" if stat_bits else None
-
-    if not line1 and not line2:
+    if not lines:
         return None
-    out = "\n\n---"
-    if line1:
-        out += f"\n{line1}"
-    if line2:
-        out += f"\n{line2}"
-    return out
+    return "\n\n---\n" + "\n".join(lines)
 
 
 def fmt_measured_tps(usage: dict | None, measured: dict | None) -> str | None:
