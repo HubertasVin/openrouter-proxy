@@ -7,7 +7,6 @@ Run: OPENROUTER_API_KEY=sk-or-... PRIVACY_MODE=prioritise_privacy uvicorn main:a
 import os
 import time
 import json
-import hashlib
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -16,7 +15,6 @@ OPENROUTER = "https://openrouter.ai/api/v1"
 FRONTEND = "https://openrouter.ai/api/frontend/v1"
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PRIVACY_MODE = os.environ.get("PRIVACY_MODE", "prioritise_privacy").lower()
-SHOW_FOOTER = os.environ.get("PROXY_FOOTER", "1").lower() not in ("0", "false", "no")
 
 app = FastAPI()
 
@@ -30,13 +28,9 @@ MODE_POLICY = {
 
 POLICY_TTL = 3600.0
 PICK_TTL = 60.0
-RUN_TTL = float(os.environ.get("RUN_TTL", 3600.0))  # agent-run accumulator expiry
 _policies: dict[str, dict] = {}
 _policies_at = 0.0
 _pick_cache: dict[str, tuple[float, list[str], list[dict], dict[str, dict]]] = {}
-# run-key -> {"calls", "tokens", "cost", "ms", "t"} for the current agent run
-# (one user prompt -> Copilot's tool-loop makes several LLM calls)
-_runs: dict[str, dict] = {}
 
 
 async def load_policies(client: httpx.AsyncClient) -> dict[str, dict]:
@@ -155,9 +149,7 @@ def filter_providers(endpoints: list[dict], policies: dict[str, dict],
 
 
 async def pick_provider(model: str, auth: str) -> tuple[list[str], list[dict], dict[str, dict]]:
-    """Fetch the model's endpoints and pick via filter_providers.
-    Returns (winning endpoint tags in fallback order, full endpoint list,
-    policy map) — the latter two feed the response footer's stats."""
+    """Fetch the model's endpoints and pick via filter_providers."""
     key = f"{model}|{PRIVACY_MODE}"
     now = time.time()
     cached = _pick_cache.get(key)
@@ -195,333 +187,6 @@ def upstream_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def privacy_label(ep: dict, policies: dict[str, dict]) -> str:
-    pol = policies.get(provider_slug(ep))
-    if pol is None:
-        return "policy unknown"
-    retains = pol.get("retainsPrompts", True)
-    trains = pol.get("training", True) or pol.get("trainingOpenRouter", True)
-    if not retains and not trains:
-        return "fully private"
-    if retains and trains:
-        return "retains + trains"
-    return "retains prompts" if retains else "trains on prompts"
-
-
-def fmt_throughput(ep: dict) -> str | None:
-    t = throughput(ep)
-    return f"{t:g} tok/s" if t > 0 else None
-
-
-def fmt_latency(ep: dict) -> str | None:
-    lat = ep.get("latency_last_30m")
-    if isinstance(lat, dict):
-        lat = lat.get("p50")
-    if isinstance(lat, (int, float)) and lat > 0:
-        return f"{lat:g} ms p50"    
-    return None
-
-
-def fmt_ms(ms: float) -> str:
-    return f"{ms:g} ms" if ms < 1000 else f"{ms / 1000:g} s"
-
-
-def fmt_price(ep: dict) -> str | None:
-    pr = ep.get("pricing") or {}
-    try:
-        p = float(pr.get("prompt") or 0) * 1e6
-        c = float(pr.get("completion") or 0) * 1e6
-    except (TypeError, ValueError):
-        return None
-    return f"${round(p, 4):g}/${round(c, 4):g} per M"
-
-
-def first_user_text(messages: list) -> str:
-    for m in messages or []:
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        c = m.get("content")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-    return ""
-
-
-def run_key(model: str, messages: list) -> str | None:
-    """Identity of one agent run (one user prompt): Copilot's tool loop repeats
-    the same first user message across its follow-up calls."""
-    text = first_user_text(messages)
-    if not text:
-        return None
-    return hashlib.sha256(f"{model}|{text}".encode()).hexdigest()[:16]
-
-
-def update_run(key: str | None, usage: dict | None, total_ms: float,
-               meta: dict | None, endpoints: list[dict],
-               policies: dict[str, dict]) -> dict | None:
-    """Fold this call's metrics and serving-endpoint info into the run
-    accumulator; return the run stats for the footer."""
-    if not key:
-        return None
-    now = time.time()
-    for k in [k for k, v in _runs.items() if now - v["t"] > RUN_TTL]:
-        del _runs[k]
-    run = _runs.setdefault(key, {"calls": 0, "tokens": 0, "cost": 0.0,
-                                 "ms": 0.0, "t": now, "providers": {}})
-    run["calls"] += 1
-    run["ms"] += total_ms
-    run["t"] = now
-    if isinstance(usage, dict):
-        n = usage.get("completion_tokens")
-        if isinstance(n, (int, float)) and n > 0:
-            run["tokens"] += int(n)
-        cost = usage.get("cost")
-        if isinstance(cost, (int, float)) and cost > 0:
-            run["cost"] += cost
-    sel, ep = match_endpoint(meta or {}, endpoints)
-    if sel:
-        name = sel.get("provider") or "?"
-        prov = run["providers"].setdefault(name, {"calls": 0, "tokens": 0,
-                                                  "ms": 0.0, "q": None,
-                                                  "privacy": None, "price": None,
-                                                  "cache": False})
-        prov["calls"] += 1
-        prov["ms"] += total_ms
-        if isinstance(usage, dict):
-            n = usage.get("completion_tokens")
-            if isinstance(n, (int, float)) and n > 0:
-                prov["tokens"] += int(n)
-        if ep:
-            q = ep.get("quantization")
-            if q and q != "unknown":
-                prov["q"] = q
-            prov["privacy"] = privacy_label(ep, policies)
-            prov["price"] = fmt_price(ep)
-            if ep.get("supports_implicit_caching"):
-                prov["cache"] = True
-    return run
-
-
-def fmt_provider_line(name: str, prov: dict) -> str:
-    """One provider's run-so-far aggregates (no per-call cost/tokens/time)."""
-    bits = [f"**{name}**"]
-    calls = prov["calls"]
-    if calls > 1:
-        bits.append(f"{calls} calls")
-    if prov["ms"] > 0 and prov["tokens"]:
-        bits.append(f"avg {prov['tokens'] / (prov['ms'] / 1000):.1f} tok/s")
-    if calls > 1 and prov["ms"] > 0:
-        bits.append(f"avg {fmt_ms(prov['ms'] / calls)}/call")
-    for key in ("q", "privacy", "price"):
-        if prov[key]:
-            bits.append(prov[key])
-    if prov["cache"]:
-        bits.append("implicit cache")
-    return f"*via {' · '.join(bits)}*"
-
-
-def fmt_run(run: dict | None, usage: dict | None,
-            measured: dict | None) -> str | None:
-    """Footer: one line per provider used in the run (its aggregates + endpoint
-    stats), then the run total."""
-    if not run:
-        # no run tracking (e.g. keyless lookups): minimal per-call footer
-        mtps = fmt_measured_tps(usage, measured)
-        if not mtps:
-            return None
-        bits = [mtps]
-        if isinstance(measured, dict):
-            v = measured.get("total_ms")
-            if isinstance(v, (int, float)) and v > 0:
-                bits.append(f"total {fmt_ms(v)}")
-        return f"\n\n---\n*{(' · '.join(bits))}*"
-
-    lines = [fmt_provider_line(name, prov)
-             for name, prov in run["providers"].items()]
-
-    bits = []
-    if run["calls"] > 1:
-        bits.append(f"{run['calls']} calls")
-    if run["ms"] > 0 and run["tokens"]:
-        bits.append(f"avg {run['tokens'] / (run['ms'] / 1000):.1f} tok/s")
-    if run["calls"] > 1 and run["ms"] > 0:
-        bits.append(f"avg {fmt_ms(run['ms'] / run['calls'])}/call")
-    if run["ms"]:
-        bits.append(f"{fmt_ms(run['ms'])} total")
-    if run["tokens"]:
-        bits.append(f"{run['tokens']:,} tok")
-    if run["cost"]:
-        bits.append(f"${round(run['cost'], 5):g}")
-    if bits:
-        lines.append(f"*Run total: {' · '.join(bits)}*")
-
-    if not lines:
-        return None
-    return "\n\n---\n" + "\n".join(lines)
-
-
-def fmt_measured_tps(usage: dict | None, measured: dict | None) -> str | None:
-    """Request-measured tok/s: completion tokens over the relayed stream time.
-    Shown when the endpoints lookup lacks stats (unauthenticated lookup)."""
-    if not isinstance(usage, dict) or not isinstance(measured, dict):
-        return None
-    total_ms = measured.get("total_ms")
-    n = usage.get("completion_tokens")
-    if not isinstance(total_ms, (int, float)) or total_ms <= 0:
-        return None
-    if not isinstance(n, (int, float)) or n <= 0:
-        return None
-    return f"{n / (total_ms / 1000):.1f} tok/s"
-
-
-def fmt_cost(usage: dict | None) -> str | None:
-    if not isinstance(usage, dict):
-        return None
-    cost = usage.get("cost")
-    if not isinstance(cost, (int, float)):
-        return None
-    return f"${round(cost, 5):g}"
-
-
-def match_endpoint(meta: dict, endpoints: list[dict]) -> tuple[dict | None, dict | None]:
-    """Find the metadata's selected endpoint and the matching stats entry
-    (matched by provider_name, disambiguated by the served model slug)."""
-    eps = (meta.get("endpoints") or {}).get("available") or []
-    sel = next((e for e in eps if e.get("selected")), None)
-    if not sel:
-        return None, None
-    provider = sel.get("provider") or ""
-    served = sel.get("model") or ""
-    cands = [e for e in endpoints if e.get("provider_name") == provider]
-    if len(cands) > 1 and served:
-        named = [e for e in cands if served in (e.get("name") or "")]
-        if named:
-            cands = named
-    return sel, (cands[0] if cands else None)
-
-
-def provider_footer(meta: dict, endpoints: list[dict], policies: dict[str, dict],
-                    usage: dict | None = None,
-                    measured: dict | None = None,
-                    run: dict | None = None) -> str | None:
-    """Compact footer: run aggregates (avg throughput/latency, totals) plus the
-    serving-endpoint stats. One block, at most two lines."""
-    return fmt_run(run, usage, measured)
-
-
-def sse_delta(obj: dict, footer: str) -> bytes:
-    chunk = {
-        "id": obj.get("id"),
-        "object": "chat.completion.chunk",
-        "created": obj.get("created"),
-        "model": obj.get("model"),
-        "choices": [{"index": 0, "delta": {"content": footer}, "finish_reason": None}],
-    }
-    return f"data: {json.dumps(chunk)}\n\n".encode()
-
-
-def sse_rewrite(line: bytes, footer: str) -> bytes:
-    """Append footer text to a data line's delta.content."""
-    obj = json.loads(line[6:])
-    ch = (obj.get("choices") or [{}])[0]
-    delta = ch.setdefault("delta", {})
-    delta["content"] = (delta.get("content") or "") + footer
-    return f"data: {json.dumps(obj)}".encode()
-
-
-async def sse_with_footer(chunks, endpoints: list[dict], policies: dict[str, dict],
-                          t0: float | None = None, rkey: str | None = None):
-    """Pass upstream SSE through with the provider-info footer folded into the
-    last content chunk. A footer delta emitted after the finish_reason chunk is
-    dropped by clients that finalize the message there (VS Code chat), so the
-    footer must ride on content no later than the stop chunk. The last content
-    line, the stop line and everything after are buffered until [DONE]; the
-    footer is then folded into the buffered content line (or the stop line when
-    the response had no content), which is emitted before the stop line."""
-    buf = b""
-    usage: dict | None = None
-    meta_obj: dict | None = None
-    held: bytes | None = None
-    stop_line: bytes | None = None
-    tail: list[bytes] = []
-    injected = False
-    ttft_ms: float | None = None
-
-    async for chunk in chunks:
-        if t0 is not None and ttft_ms is None:
-            ttft_ms = (time.monotonic() - t0) * 1000  # first upstream byte
-        buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            text = line.rstrip(b"\r")
-
-            if text == b"data: [DONE]":
-                if SHOW_FOOTER and meta_obj is not None:
-                    total_ms = (time.monotonic() - t0) * 1000 if t0 is not None else 0.0
-                    measured = {"total_ms": total_ms} if t0 is not None else {}
-                    run = update_run(rkey, usage, total_ms,
-                                     meta_obj["openrouter_metadata"], endpoints, policies)
-                    footer = provider_footer(meta_obj["openrouter_metadata"],
-                                             endpoints, policies, usage, measured, run)
-                    if footer:
-                        injected = True
-                        target = held if held is not None else stop_line
-                        if target is not None:
-                            target = sse_rewrite(target, footer)
-                            if held is not None:
-                                held = target
-                            else:
-                                stop_line = target
-                for out in (held, stop_line):
-                    if out is not None:
-                        yield out + b"\n"
-                held = stop_line = None
-                for t in tail:
-                    yield t + b"\n"
-                tail = []
-                yield text + b"\n"
-                continue
-
-            obj = None
-            if text.startswith(b"data: "):
-                try:
-                    obj = json.loads(text[6:])
-                except ValueError:
-                    obj = None
-            if isinstance(obj, dict) and obj.get("usage"):
-                usage = obj["usage"]
-            if isinstance(obj, dict) and obj.get("openrouter_metadata") and meta_obj is None:
-                meta_obj = obj
-
-            is_content = (isinstance(obj, dict) and obj.get("choices")
-                          and isinstance((obj["choices"][0].get("delta") or {}).get("content"), str)
-                          and obj["choices"][0]["delta"]["content"] != "")
-            has_finish = isinstance(obj, dict) and obj.get("choices") and obj["choices"][0].get("finish_reason")
-
-            if is_content:
-                if held is not None:
-                    yield held + b"\n"
-                held = text
-            elif has_finish and stop_line is None:
-                stop_line = text
-            else:
-                if stop_line is not None:
-                    tail.append(text)
-                else:
-                    yield text + b"\n"
-
-    for out in (held, stop_line):
-        if out is not None:
-            yield out + b"\n"
-    for t in tail:
-        yield t + b"\n"
-    if buf:
-        yield buf
-    print(f"[footer] stream: metadata={'yes' if meta_obj is not None else 'no'} "
-          f"injected={injected} ttft={ttft_ms and round(ttft_ms)}ms", flush=True)
-
-
 async def relay(request: Request, body: bytes | None):
     headers = upstream_headers(request)
     path = request.url.path.removeprefix("/").removeprefix("v1/").removeprefix("/")
@@ -529,7 +194,6 @@ async def relay(request: Request, body: bytes | None):
 
     endpoints: list[dict] = []
     policies: dict[str, dict] = {}
-    rkey: str | None = None
     if body is not None:
         try:
             parsed = json.loads(body)
@@ -537,7 +201,6 @@ async def relay(request: Request, body: bytes | None):
             return JSONResponse(status_code=400,
                                 content={"error": {"message": "request body is not valid JSON"}})
         model = parsed.get("model", "")
-        rkey = run_key(model, parsed.get("messages"))
         try:
             tags, endpoints, policies = await pick_provider(model, headers.get("Authorization", ""))
         except httpx.HTTPError:
@@ -551,14 +214,11 @@ async def relay(request: Request, body: bytes | None):
             parsed["provider"] = {"order": tags, "allow_fallbacks": False}
         else:
             parsed.pop("provider", None)
-        if "messages" in parsed and "usage" not in parsed:
-            parsed["usage"] = {"include": True}
         body = json.dumps(parsed).encode()
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=30.0))
     req = client.build_request(request.method, url, content=body, headers=headers,
                                params=request.url.query)
-    t0 = time.monotonic()
     resp = await client.send(req, stream=True)
 
     if resp.status_code >= 400:
@@ -576,8 +236,7 @@ async def relay(request: Request, body: bytes | None):
     if "text/event-stream" in ctype:
         async def stream():
             try:
-                async for chunk in sse_with_footer(resp.aiter_bytes(), endpoints,
-                                                   policies, t0, rkey):
+                async for chunk in resp.aiter_bytes():
                     yield chunk
             finally:
                 await resp.aclose()
@@ -586,28 +245,8 @@ async def relay(request: Request, body: bytes | None):
                                  media_type=ctype)
 
     content = await resp.aread()
-    total_ms = (time.monotonic() - t0) * 1000
     await resp.aclose()
     await client.aclose()
-
-    if SHOW_FOOTER and "application/json" in ctype:
-        try:
-            payload = json.loads(content)
-            run = update_run(rkey, payload.get("usage"), total_ms,
-                             payload.get("openrouter_metadata") or {},
-                             endpoints, policies)
-            footer = provider_footer(payload.get("openrouter_metadata") or {},
-                                     endpoints, policies, payload.get("usage"),
-                                     {"total_ms": total_ms}, run)
-            print(f"[footer] json: metadata={'yes' if payload.get('openrouter_metadata') else 'no'} "
-                  f"footer={'yes' if footer else 'no'}", flush=True)
-            if footer and payload.get("choices"):
-                msg = payload["choices"][0].get("message") or {}
-                if isinstance(msg.get("content"), str):
-                    msg["content"] += footer
-                    content = json.dumps(payload).encode()
-        except (ValueError, KeyError, IndexError):
-            pass
 
     return Response(content=content, media_type=ctype or "application/json")
 

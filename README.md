@@ -22,7 +22,6 @@ for clients that send no key (e.g. curl testing).
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | Optional. Fallback key when the client sends no `Authorization`; the client's own key always takes priority. Also used for the endpoint lookup when set (throughput stats require auth). |
 | `PRIVACY_MODE` | `prioritise_privacy` | `full_privacy`, `prioritise_privacy`, `can_retain_prompts`, or `can_train`. |
-| `PROXY_FOOTER` | `1` | Set `0` to disable the provider-info footer. |
 
 Privacy modes:
 
