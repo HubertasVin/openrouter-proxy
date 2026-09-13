@@ -1,7 +1,7 @@
 # openrouter-proxy
 
 FastAPI proxy that reroutes OpenAI-style requests to OpenRouter, filtering
-providers by quantization, throughput and privacy policy. Point any
+ providers by throughput and privacy policy. Point any
 OpenAI-compatible client at `http://localhost:8787/v1`.
 
 ## Run
@@ -45,12 +45,11 @@ client fallback, preserved across reinstalls in `~/.config/openrouter-proxy/env`
 
 ## Filtering
 
-1. Endpoint must be quantized at 8 bits or below (`int8`/`fp8`/`mxfp8`/`fp4`).
-2. Privacy must satisfy the selected mode.
-3. Absolute throughput floor: starts at 30 tok/s and relaxes through 25, 20
+1. Privacy must satisfy the selected mode.
+2. Absolute throughput floor: starts at 30 tok/s and relaxes through 25, 20
    and 15 tok/s until ≥2 endpoints clear it. Unmeasured endpoints are never
    dropped.
-4. Winner = cheapest survivor, with prices within 1% treated as tied and the
+3. Winner = cheapest survivor, with prices within 1% treated as tied and the
    faster endpoint preferred within a tie.
 
 The pick is cached per model+mode for 60 s. A failed lookup routes unpinned in

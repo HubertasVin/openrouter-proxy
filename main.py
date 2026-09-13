@@ -1,5 +1,5 @@
 """Simple proxy that reroutes OpenAI-style requests to OpenRouter,
-filtering providers by quantization, throughput and privacy policy.
+filtering providers by throughput and privacy policy.
 
 Run: OPENROUTER_API_KEY=sk-or-... PRIVACY_MODE=prioritise_privacy uvicorn main:app --port 8787
 """
@@ -53,10 +53,6 @@ def provider_slug(ep: dict) -> str:
     return (ep.get("tag") or "").split("/")[0]
 
 
-def quant_ok(ep: dict) -> bool:
-    return ep.get("quantization") in ("int8", "fp8", "mxfp8", "fp4")
-
-
 def price(ep: dict) -> float:
     pr = ep.get("pricing") or {}
     try:
@@ -94,14 +90,14 @@ def privacy_ok(ep: dict, policies: dict[str, dict],
 
 def filter_providers(endpoints: list[dict], policies: dict[str, dict],
                      mode: str) -> list[dict]:
-    """Single filtering method: quantization + privacy + absolute throughput
+    """Single filtering method: privacy + absolute throughput
     floors. Returns surviving endpoints, cheapest first; the prioritise_privacy
     winner (if any) is moved to the front. The full list is used as
     provider.order so OpenRouter falls back within the filtered set when a
     provider is rate-limited or down."""
     allow_retention, allow_training = MODE_POLICY.get(mode, MODE_POLICY["prioritise_privacy"])
     pool = [e for e in endpoints
-            if quant_ok(e) and privacy_ok(e, policies, allow_retention, allow_training)]
+            if privacy_ok(e, policies, allow_retention, allow_training)]
     if not pool:
         return []
 
