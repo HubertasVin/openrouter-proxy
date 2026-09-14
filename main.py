@@ -7,6 +7,7 @@ Run: OPENROUTER_API_KEY=sk-or-... PRIVACY_MODE=prioritise_privacy uvicorn main:a
 import os
 import time
 import json
+import logging
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, Response
@@ -15,6 +16,10 @@ OPENROUTER = "https://openrouter.ai/api/v1"
 FRONTEND = "https://openrouter.ai/api/frontend/v1"
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 PRIVACY_MODE = os.environ.get("PRIVACY_MODE", "prioritise_privacy").lower()
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(name)s %(levelname)s %(message)s")
+log = logging.getLogger("openrouter-proxy")
 
 app = FastAPI()
 
@@ -44,8 +49,8 @@ async def load_policies(client: httpx.AsyncClient) -> dict[str, dict]:
         r.raise_for_status()
         _policies = {p["slug"]: p.get("dataPolicy") or {} for p in r.json().get("data", [])}
         _policies_at = time.time()
-    except httpx.HTTPError:
-        pass
+    except httpx.HTTPError as exc:
+        log.warning("policy fetch failed: %s", exc)
     return _policies
 
 
@@ -199,9 +204,10 @@ async def relay(request: Request, body: bytes | None):
         model = parsed.get("model", "")
         try:
             tags, endpoints, policies = await pick_provider(model, headers.get("Authorization", ""))
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            log.warning("provider pick failed for %r: %s", model, exc)
             tags = []
-        print(f"[relay] model={model!r} tags={len(tags)}", flush=True)
+        log.info("[relay] model=%r tags=%d order=%s", model, len(tags), ",".join(tags[:3]))
         if not tags and PRIVACY_MODE != "can_train":
             return JSONResponse(status_code=502, content={"error": {
                 "message": f"no provider satisfies PRIVACY_MODE={PRIVACY_MODE} "
@@ -215,7 +221,17 @@ async def relay(request: Request, body: bytes | None):
     client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=30.0))
     req = client.build_request(request.method, url, content=body, headers=headers,
                                params=request.url.query)
-    resp = await client.send(req, stream=True)
+    started = time.time()
+    try:
+        resp = await client.send(req, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        log.error("[upstream] %s %s failed after %.0fms: %s",
+                  request.method, url, (time.time() - started) * 1000, exc)
+        return JSONResponse(status_code=502, content={"error": {
+            "message": f"upstream request failed: {exc}"}})
+    log.info("[upstream] %s %s -> %d in %.0fms",
+             request.method, url, resp.status_code, (time.time() - started) * 1000)
 
     if resp.status_code >= 400:
         content = await resp.aread()
