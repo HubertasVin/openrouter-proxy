@@ -59,6 +59,8 @@ Type=simple
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$CONFIG_DIR/env
 ExecStart=$INSTALL_DIR/.venv/bin/uvicorn main:app --host 127.0.0.1 --port $PORT
+TimeoutStopSec=10
+KillMode=mixed
 Restart=on-failure
 
 [Install]
